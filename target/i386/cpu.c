@@ -3880,6 +3880,9 @@ arch_query_cpu_model_expansion(CpuModelExpansionType type,
     }
 
     props = qdict_new();
+    ret->model = g_new0(CpuModelInfo, 1);
+    ret->model->props = QOBJECT(props);
+    ret->model->has_props = true;
 
     switch (type) {
     case CPU_MODEL_EXPANSION_TYPE_STATIC:
@@ -3900,15 +3903,9 @@ arch_query_cpu_model_expansion(CpuModelExpansionType type,
         goto out;
     }
 
-    if (!props) {
-        props = qdict_new();
-    }
     x86_cpu_to_dict(xc, props);
 
-    ret->model = g_new0(CpuModelInfo, 1);
     ret->model->name = g_strdup(base_name);
-    ret->model->props = QOBJECT(props);
-    ret->model->has_props = true;
 
 out:
     object_unref(OBJECT(xc));
@@ -5126,14 +5123,15 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
      * NOTE: the following code has to follow qemu_init_vcpu(). Otherwise
      * cs->nr_threads hasn't be populated yet and the checking is incorrect.
      */
-     if (IS_AMD_CPU(env) &&
-         !(env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_TOPOEXT) &&
-         cs->nr_threads > 1 && !ht_warned) {
-            error_report("This family of AMD CPU doesn't support "
-                         "hyperthreading(%d). Please configure -smp "
-                         "options properly or try enabling topoext feature.",
-                         cs->nr_threads);
-        ht_warned = true;
+    if (IS_AMD_CPU(env) &&
+        !(env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_TOPOEXT) &&
+        cs->nr_threads > 1 && !ht_warned) {
+            warn_report("This family of AMD CPU doesn't support "
+                        "hyperthreading(%d)",
+                        cs->nr_threads);
+            error_printf("Please configure -smp options properly"
+                         " or try enabling topoext feature.\n");
+            ht_warned = true;
     }
 
     x86_cpu_apic_realize(cpu, &local_err);
@@ -5432,20 +5430,51 @@ static void x86_cpu_synchronize_from_tb(CPUState *cs, TranslationBlock *tb)
     cpu->env.eip = tb->pc - tb->cs_base;
 }
 
-static bool x86_cpu_has_work(CPUState *cs)
+int x86_cpu_pending_interrupt(CPUState *cs, int interrupt_request)
 {
     X86CPU *cpu = X86_CPU(cs);
     CPUX86State *env = &cpu->env;
 
-    return ((cs->interrupt_request & (CPU_INTERRUPT_HARD |
-                                      CPU_INTERRUPT_POLL)) &&
-            (env->eflags & IF_MASK)) ||
-           (cs->interrupt_request & (CPU_INTERRUPT_NMI |
-                                     CPU_INTERRUPT_INIT |
-                                     CPU_INTERRUPT_SIPI |
-                                     CPU_INTERRUPT_MCE)) ||
-           ((cs->interrupt_request & CPU_INTERRUPT_SMI) &&
-            !(env->hflags & HF_SMM_MASK));
+#if !defined(CONFIG_USER_ONLY)
+    if (interrupt_request & CPU_INTERRUPT_POLL) {
+        return CPU_INTERRUPT_POLL;
+    }
+#endif
+    if (interrupt_request & CPU_INTERRUPT_SIPI) {
+        return CPU_INTERRUPT_SIPI;
+    }
+
+    if (env->hflags2 & HF2_GIF_MASK) {
+        if ((interrupt_request & CPU_INTERRUPT_SMI) &&
+            !(env->hflags & HF_SMM_MASK)) {
+            return CPU_INTERRUPT_SMI;
+        } else if ((interrupt_request & CPU_INTERRUPT_NMI) &&
+                   !(env->hflags2 & HF2_NMI_MASK)) {
+            return CPU_INTERRUPT_NMI;
+        } else if (interrupt_request & CPU_INTERRUPT_MCE) {
+            return CPU_INTERRUPT_MCE;
+        } else if ((interrupt_request & CPU_INTERRUPT_HARD) &&
+                   (((env->hflags2 & HF2_VINTR_MASK) &&
+                     (env->hflags2 & HF2_HIF_MASK)) ||
+                    (!(env->hflags2 & HF2_VINTR_MASK) &&
+                     (env->eflags & IF_MASK &&
+                      !(env->hflags & HF_INHIBIT_IRQ_MASK))))) {
+            return CPU_INTERRUPT_HARD;
+#if !defined(CONFIG_USER_ONLY)
+        } else if ((interrupt_request & CPU_INTERRUPT_VIRQ) &&
+                   (env->eflags & IF_MASK) &&
+                   !(env->hflags & HF_INHIBIT_IRQ_MASK)) {
+            return CPU_INTERRUPT_VIRQ;
+#endif
+        }
+    }
+
+    return 0;
+}
+
+static bool x86_cpu_has_work(CPUState *cs)
+{
+    return x86_cpu_pending_interrupt(cs, cs->interrupt_request) != 0;
 }
 
 static void x86_disas_set_info(CPUState *cs, disassemble_info *info)
@@ -5536,6 +5565,7 @@ static Property x86_cpu_properties[] = {
     DEFINE_PROP_BOOL("hv-frequencies", X86CPU, hyperv_frequencies, false),
     DEFINE_PROP_BOOL("hv-reenlightenment", X86CPU, hyperv_reenlightenment, false),
     DEFINE_PROP_BOOL("hv-tlbflush", X86CPU, hyperv_tlbflush, false),
+    DEFINE_PROP_BOOL("hv-ipi", X86CPU, hyperv_ipi, false),
     DEFINE_PROP_BOOL("check", X86CPU, check_cpuid, true),
     DEFINE_PROP_BOOL("enforce", X86CPU, enforce_cpuid, false),
     DEFINE_PROP_BOOL("kvm", X86CPU, expose_kvm, true),
@@ -5578,6 +5608,8 @@ static Property x86_cpu_properties[] = {
      * to the specific Windows version being used."
      */
     DEFINE_PROP_INT32("x-hv-max-vps", X86CPU, hv_max_vps, -1),
+    DEFINE_PROP_BOOL("x-hv-synic-kvm-only", X86CPU, hyperv_synic_kvm_only,
+                     false),
     DEFINE_PROP_END_OF_LIST()
 };
 

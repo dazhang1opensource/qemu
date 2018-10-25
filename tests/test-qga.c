@@ -147,8 +147,9 @@ static void test_qga_sync_delimited(gconstpointer fix)
     unsigned char c;
     QDict *ret;
 
+    qmp_fd_send_raw(fixture->fd, "\xff");
     qmp_fd_send(fixture->fd,
-                "\xff{'execute': 'guest-sync-delimited',"
+                "{'execute': 'guest-sync-delimited',"
                 " 'arguments': {'id': %u } }",
                 r);
 
@@ -243,17 +244,12 @@ static void test_qga_invalid_id(gconstpointer fix)
 static void test_qga_invalid_oob(gconstpointer fix)
 {
     const TestFixture *fixture = fix;
-    QDict *ret, *error;
-    const char *class;
+    QDict *ret;
 
     ret = qmp_fd(fixture->fd, "{'exec-oob': 'guest-ping'}");
     g_assert_nonnull(ret);
 
-    error = qdict_get_qdict(ret, "error");
-    class = qdict_get_try_str(error, "class");
-    g_assert_cmpstr(class, ==, "GenericError");
-
-    qobject_unref(ret);
+    qmp_assert_error_class(ret, "GenericError");
 }
 
 static void test_qga_invalid_args(gconstpointer fix)

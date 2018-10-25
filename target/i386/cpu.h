@@ -171,7 +171,7 @@ typedef enum X86Seg {
 #define HF_AC_SHIFT         18 /* must be same as eflags */
 #define HF_SMM_SHIFT        19 /* CPU in SMM mode */
 #define HF_SVME_SHIFT       20 /* SVME enabled (copy of EFER.SVME) */
-#define HF_SVMI_SHIFT       21 /* SVM intercepts are active */
+#define HF_GUEST_SHIFT      21 /* SVM intercepts are active */
 #define HF_OSFXSR_SHIFT     22 /* CR4.OSFXSR */
 #define HF_SMAP_SHIFT       23 /* CR4.SMAP */
 #define HF_IOBPT_SHIFT      24 /* an io breakpoint enabled */
@@ -196,7 +196,7 @@ typedef enum X86Seg {
 #define HF_AC_MASK           (1 << HF_AC_SHIFT)
 #define HF_SMM_MASK          (1 << HF_SMM_SHIFT)
 #define HF_SVME_MASK         (1 << HF_SVME_SHIFT)
-#define HF_SVMI_MASK         (1 << HF_SVMI_SHIFT)
+#define HF_GUEST_MASK        (1 << HF_GUEST_SHIFT)
 #define HF_OSFXSR_MASK       (1 << HF_OSFXSR_SHIFT)
 #define HF_SMAP_MASK         (1 << HF_SMAP_SHIFT)
 #define HF_IOBPT_MASK        (1 << HF_IOBPT_SHIFT)
@@ -1327,7 +1327,9 @@ typedef struct CPUX86State {
     bool tsc_valid;
     int64_t tsc_khz;
     int64_t user_tsc_khz; /* for sanity check only */
-    void *kvm_xsave_buf;
+#if defined(CONFIG_KVM) || defined(CONFIG_HVF)
+    void *xsave_buf;
+#endif
 #if defined(CONFIG_HVF)
     HVFX86EmulatorState *hvf_emul;
 #endif
@@ -1376,10 +1378,12 @@ struct X86CPU {
     bool hyperv_vpindex;
     bool hyperv_runtime;
     bool hyperv_synic;
+    bool hyperv_synic_kvm_only;
     bool hyperv_stimer;
     bool hyperv_frequencies;
     bool hyperv_reenlightenment;
     bool hyperv_tlbflush;
+    bool hyperv_ipi;
     bool check_cpuid;
     bool enforce_cpuid;
     bool expose_kvm;
@@ -1485,6 +1489,7 @@ extern struct VMStateDescription vmstate_x86_cpu;
  */
 void x86_cpu_do_interrupt(CPUState *cpu);
 bool x86_cpu_exec_interrupt(CPUState *cpu, int int_req);
+int x86_cpu_pending_interrupt(CPUState *cs, int interrupt_request);
 
 int x86_cpu_write_elf64_note(WriteCoreDumpFunction f, CPUState *cpu,
                              int cpuid, void *opaque);
@@ -1515,6 +1520,8 @@ int cpu_x86_support_mca_broadcast(CPUX86State *env);
 int cpu_get_pic_interrupt(CPUX86State *s);
 /* MSDOS compatibility mode FPU exception support */
 void cpu_set_ferr(CPUX86State *s);
+/* mpx_helper.c */
+void cpu_sync_bndcs_hflags(CPUX86State *env);
 
 /* this function must always be used to load data in the segment
    cache: it synchronizes the hflags with the segment cache values */
@@ -1557,6 +1564,8 @@ static inline void cpu_x86_load_seg_cache(CPUX86State *env,
 #error HF_CPL_MASK is hardcoded
 #endif
             env->hflags = (env->hflags & ~HF_CPL_MASK) | cpl;
+            /* Possibly switch between BNDCFGS and BNDCFGU */
+            cpu_sync_bndcs_hflags(env);
         }
         new_hflags = (env->segs[R_SS].flags & DESC_B_MASK)
             >> (DESC_B_SHIFT - HF_SS32_SHIFT);
@@ -1888,9 +1897,6 @@ void apic_handle_tpr_access_report(DeviceState *d, target_ulong ip,
  * are already present in the kvm_default_props table.
  */
 void x86_cpu_change_kvm_default(const char *prop, const char *value);
-
-/* mpx_helper.c */
-void cpu_sync_bndcs_hflags(CPUX86State *env);
 
 /* Return name of 32-bit register, from a R_* constant */
 const char *get_register_name_32(unsigned int reg);

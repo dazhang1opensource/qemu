@@ -65,8 +65,11 @@ static void test_drive_without_dev(void)
 
 static void test_after_failed_device_add(void)
 {
+    char driver[32];
     QDict *response;
-    QDict *error;
+
+    snprintf(driver, sizeof(driver), "virtio-blk-%s",
+             qvirtio_get_dev_type());
 
     qtest_start("-drive if=none,id=drive0");
 
@@ -75,13 +78,11 @@ static void test_after_failed_device_add(void)
      */
     response = qmp("{'execute': 'device_add',"
                    " 'arguments': {"
-                   "   'driver': 'virtio-blk-%s',"
+                   "   'driver': %s,"
                    "   'drive': 'drive0'"
-                   "}}", qvirtio_get_dev_type());
+                   "}}", driver);
     g_assert(response);
-    error = qdict_get_qdict(response, "error");
-    g_assert_cmpstr(qdict_get_try_str(error, "class"), ==, "GenericError");
-    qobject_unref(response);
+    qmp_assert_error_class(response, "GenericError");
 
     /* Delete the drive */
     drive_del();

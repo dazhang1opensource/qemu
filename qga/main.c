@@ -18,7 +18,6 @@
 #include <syslog.h>
 #include <sys/wait.h>
 #endif
-#include "qapi/qmp/json-streamer.h"
 #include "qapi/qmp/json-parser.h"
 #include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qjson.h"
@@ -341,46 +340,6 @@ static FILE *ga_open_logfile(const char *logfile)
     return f;
 }
 
-#ifndef _WIN32
-static bool ga_open_pidfile(const char *pidfile)
-{
-    int pidfd;
-    char pidstr[32];
-
-    pidfd = qemu_open(pidfile, O_CREAT|O_WRONLY, S_IRUSR|S_IWUSR);
-    if (pidfd == -1 || lockf(pidfd, F_TLOCK, 0)) {
-        g_critical("Cannot lock pid file, %s", strerror(errno));
-        if (pidfd != -1) {
-            close(pidfd);
-        }
-        return false;
-    }
-
-    if (ftruncate(pidfd, 0)) {
-        g_critical("Failed to truncate pid file");
-        goto fail;
-    }
-    snprintf(pidstr, sizeof(pidstr), "%d\n", getpid());
-    if (write(pidfd, pidstr, strlen(pidstr)) != strlen(pidstr)) {
-        g_critical("Failed to write pid file");
-        goto fail;
-    }
-
-    /* keep pidfile open & locked forever */
-    return true;
-
-fail:
-    unlink(pidfile);
-    close(pidfd);
-    return false;
-}
-#else /* _WIN32 */
-static bool ga_open_pidfile(const char *pidfile)
-{
-    return true;
-}
-#endif
-
 static gint ga_strcmp(gconstpointer str1, gconstpointer str2)
 {
     return strcmp(str1, str2);
@@ -480,8 +439,11 @@ void ga_unset_frozen(GAState *s)
     ga_enable_logging(s);
     g_warning("logging re-enabled due to filesystem unfreeze");
     if (s->deferred_options.pid_filepath) {
-        if (!ga_open_pidfile(s->deferred_options.pid_filepath)) {
-            g_warning("failed to create/open pid file");
+        Error *err = NULL;
+
+        if (!qemu_write_pidfile(s->deferred_options.pid_filepath, &err)) {
+            g_warning("%s", error_get_pretty(err));
+            error_free(err);
         }
         s->deferred_options.pid_filepath = NULL;
     }
@@ -516,8 +478,11 @@ static void become_daemon(const char *pidfile)
     }
 
     if (pidfile) {
-        if (!ga_open_pidfile(pidfile)) {
-            g_critical("failed to create pidfile");
+        Error *err = NULL;
+
+        if (!qemu_write_pidfile(pidfile, &err)) {
+            g_critical("%s", error_get_pretty(err));
+            error_free(err);
             exit(EXIT_FAILURE);
         }
     }
@@ -597,24 +562,20 @@ static void process_command(GAState *s, QDict *req)
 }
 
 /* handle requests/control events coming in over the channel */
-static void process_event(JSONMessageParser *parser, GQueue *tokens)
+static void process_event(void *opaque, QObject *obj, Error *err)
 {
-    GAState *s = container_of(parser, GAState, parser);
-    QObject *obj;
+    GAState *s = opaque;
     QDict *req, *rsp;
-    Error *err = NULL;
     int ret;
 
-    g_assert(s && parser);
-
     g_debug("process_event: called");
-    obj = json_parser_parse_err(tokens, NULL, &err);
+    assert(!obj != !err);
     if (err) {
         goto err;
     }
     req = qobject_to(QDict, obj);
     if (!req) {
-        error_setg(&err, QERR_JSON_PARSING);
+        error_setg(&err, "Input must be a JSON object");
         goto err;
     }
     if (!qdict_haskey(req, "execute")) {
@@ -1320,7 +1281,7 @@ static int run_agent(GAState *s, GAConfig *config, int socket_activation)
     s->command_state = ga_command_state_new();
     ga_command_state_init(s, s->command_state);
     ga_command_state_init_all(s->command_state);
-    json_message_parser_init(&s->parser, process_event);
+    json_message_parser_init(&s->parser, process_event, s, NULL);
 
 #ifndef _WIN32
     if (!register_signal_handlers()) {

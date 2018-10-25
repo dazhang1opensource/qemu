@@ -759,7 +759,8 @@ QemuOptsList qemu_legacy_drive_opts = {
     },
 };
 
-DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type)
+DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type,
+                     Error **errp)
 {
     const char *value;
     BlockBackend *blk;
@@ -808,7 +809,7 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type)
         qemu_opt_rename(all_opts, opt_renames[i].from, opt_renames[i].to,
                         &local_err);
         if (local_err) {
-            error_report_err(local_err);
+            error_propagate(errp, local_err);
             return NULL;
         }
     }
@@ -819,7 +820,7 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type)
         bool writethrough;
 
         if (bdrv_parse_cache_mode(value, &flags, &writethrough) != 0) {
-            error_report("invalid cache option");
+            error_setg(errp, "invalid cache option");
             return NULL;
         }
 
@@ -847,7 +848,7 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type)
                                    &error_abort);
     qemu_opts_absorb_qdict(legacy_opts, bs_opts, &local_err);
     if (local_err) {
-        error_report_err(local_err);
+        error_propagate(errp, local_err);
         goto fail;
     }
 
@@ -860,7 +861,7 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type)
             media = MEDIA_CDROM;
             read_only = true;
         } else {
-            error_report("'%s' invalid media", value);
+            error_setg(errp, "'%s' invalid media", value);
             goto fail;
         }
     }
@@ -885,7 +886,7 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type)
              type++) {
         }
         if (type == IF_COUNT) {
-            error_report("unsupported bus type '%s'", value);
+            error_setg(errp, "unsupported bus type '%s'", value);
             goto fail;
         }
     } else {
@@ -902,7 +903,7 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type)
 
     if (index != -1) {
         if (bus_id != 0 || unit_id != -1) {
-            error_report("index cannot be used with bus and unit");
+            error_setg(errp, "index cannot be used with bus and unit");
             goto fail;
         }
         bus_id = drive_index_to_bus_id(type, index);
@@ -921,13 +922,13 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type)
     }
 
     if (max_devs && unit_id >= max_devs) {
-        error_report("unit %d too big (max is %d)", unit_id, max_devs - 1);
+        error_setg(errp, "unit %d too big (max is %d)", unit_id, max_devs - 1);
         goto fail;
     }
 
     if (drive_get(type, bus_id, unit_id) != NULL) {
-        error_report("drive with bus=%d, unit=%d (index=%d) exists",
-                     bus_id, unit_id, index);
+        error_setg(errp, "drive with bus=%d, unit=%d (index=%d) exists",
+                   bus_id, unit_id, index);
         goto fail;
     }
 
@@ -970,7 +971,7 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type)
     if (werror != NULL) {
         if (type != IF_IDE && type != IF_SCSI && type != IF_VIRTIO &&
             type != IF_NONE) {
-            error_report("werror is not supported by this bus type");
+            error_setg(errp, "werror is not supported by this bus type");
             goto fail;
         }
         qdict_put_str(bs_opts, "werror", werror);
@@ -980,7 +981,7 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type)
     if (rerror != NULL) {
         if (type != IF_IDE && type != IF_VIRTIO && type != IF_SCSI &&
             type != IF_NONE) {
-            error_report("rerror is not supported by this bus type");
+            error_setg(errp, "rerror is not supported by this bus type");
             goto fail;
         }
         qdict_put_str(bs_opts, "rerror", rerror);
@@ -991,7 +992,7 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type)
     bs_opts = NULL;
     if (!blk) {
         if (local_err) {
-            error_report_err(local_err);
+            error_propagate(errp, local_err);
         }
         goto fail;
     } else {
@@ -2182,7 +2183,13 @@ static const BlkActionOps actions[] = {
         .instance_size = sizeof(BlockDirtyBitmapState),
         .prepare = block_dirty_bitmap_disable_prepare,
         .abort = block_dirty_bitmap_disable_abort,
-     }
+    },
+    /* Where are transactions for MIRROR, COMMIT and STREAM?
+     * Although these blockjobs use transaction callbacks like the backup job,
+     * these jobs do not necessarily adhere to transaction semantics.
+     * These jobs may not fully undo all of their actions on abort, nor do they
+     * necessarily work in transactions with more than one job in them.
+     */
 };
 
 /**
@@ -3116,6 +3123,8 @@ void qmp_block_stream(bool has_job_id, const char *job_id, const char *device,
                       bool has_backing_file, const char *backing_file,
                       bool has_speed, int64_t speed,
                       bool has_on_error, BlockdevOnError on_error,
+                      bool has_auto_finalize, bool auto_finalize,
+                      bool has_auto_dismiss, bool auto_dismiss,
                       Error **errp)
 {
     BlockDriverState *bs, *iter;
@@ -3123,6 +3132,7 @@ void qmp_block_stream(bool has_job_id, const char *job_id, const char *device,
     AioContext *aio_context;
     Error *local_err = NULL;
     const char *base_name = NULL;
+    int job_flags = JOB_DEFAULT;
 
     if (!has_on_error) {
         on_error = BLOCKDEV_ON_ERROR_REPORT;
@@ -3184,8 +3194,15 @@ void qmp_block_stream(bool has_job_id, const char *job_id, const char *device,
     /* backing_file string overrides base bs filename */
     base_name = has_backing_file ? backing_file : base_name;
 
+    if (has_auto_finalize && !auto_finalize) {
+        job_flags |= JOB_MANUAL_FINALIZE;
+    }
+    if (has_auto_dismiss && !auto_dismiss) {
+        job_flags |= JOB_MANUAL_DISMISS;
+    }
+
     stream_start(has_job_id ? job_id : NULL, bs, base_bs, base_name,
-                 has_speed ? speed : 0, on_error, &local_err);
+                 job_flags, has_speed ? speed : 0, on_error, &local_err);
     if (local_err) {
         error_propagate(errp, local_err);
         goto out;
@@ -3198,11 +3215,15 @@ out:
 }
 
 void qmp_block_commit(bool has_job_id, const char *job_id, const char *device,
+                      bool has_base_node, const char *base_node,
                       bool has_base, const char *base,
+                      bool has_top_node, const char *top_node,
                       bool has_top, const char *top,
                       bool has_backing_file, const char *backing_file,
                       bool has_speed, int64_t speed,
                       bool has_filter_node_name, const char *filter_node_name,
+                      bool has_auto_finalize, bool auto_finalize,
+                      bool has_auto_dismiss, bool auto_dismiss,
                       Error **errp)
 {
     BlockDriverState *bs;
@@ -3214,12 +3235,19 @@ void qmp_block_commit(bool has_job_id, const char *job_id, const char *device,
      * BlockdevOnError change for blkmirror makes it in
      */
     BlockdevOnError on_error = BLOCKDEV_ON_ERROR_REPORT;
+    int job_flags = JOB_DEFAULT;
 
     if (!has_speed) {
         speed = 0;
     }
     if (!has_filter_node_name) {
         filter_node_name = NULL;
+    }
+    if (has_auto_finalize && !auto_finalize) {
+        job_flags |= JOB_MANUAL_FINALIZE;
+    }
+    if (has_auto_dismiss && !auto_dismiss) {
+        job_flags |= JOB_MANUAL_DISMISS;
     }
 
     /* Important Note:
@@ -3250,7 +3278,20 @@ void qmp_block_commit(bool has_job_id, const char *job_id, const char *device,
     /* default top_bs is the active layer */
     top_bs = bs;
 
-    if (has_top && top) {
+    if (has_top_node && has_top) {
+        error_setg(errp, "'top-node' and 'top' are mutually exclusive");
+        goto out;
+    } else if (has_top_node) {
+        top_bs = bdrv_lookup_bs(NULL, top_node, errp);
+        if (top_bs == NULL) {
+            goto out;
+        }
+        if (!bdrv_chain_contains(bs, top_bs)) {
+            error_setg(errp, "'%s' is not in this backing file chain",
+                       top_node);
+            goto out;
+        }
+    } else if (has_top && top) {
         if (strcmp(bs->filename, top) != 0) {
             top_bs = bdrv_find_backing_image(bs, top);
         }
@@ -3263,7 +3304,20 @@ void qmp_block_commit(bool has_job_id, const char *job_id, const char *device,
 
     assert(bdrv_get_aio_context(top_bs) == aio_context);
 
-    if (has_base && base) {
+    if (has_base_node && has_base) {
+        error_setg(errp, "'base-node' and 'base' are mutually exclusive");
+        goto out;
+    } else if (has_base_node) {
+        base_bs = bdrv_lookup_bs(NULL, base_node, errp);
+        if (base_bs == NULL) {
+            goto out;
+        }
+        if (!bdrv_chain_contains(top_bs, base_bs)) {
+            error_setg(errp, "'%s' is not in this backing file chain",
+                       base_node);
+            goto out;
+        }
+    } else if (has_base && base) {
         base_bs = bdrv_find_backing_image(top_bs, base);
     } else {
         base_bs = bdrv_find_base(top_bs);
@@ -3295,15 +3349,15 @@ void qmp_block_commit(bool has_job_id, const char *job_id, const char *device,
             goto out;
         }
         commit_active_start(has_job_id ? job_id : NULL, bs, base_bs,
-                            JOB_DEFAULT, speed, on_error,
+                            job_flags, speed, on_error,
                             filter_node_name, NULL, NULL, false, &local_err);
     } else {
         BlockDriverState *overlay_bs = bdrv_find_overlay(bs, top_bs);
         if (bdrv_op_is_blocked(overlay_bs, BLOCK_OP_TYPE_COMMIT_TARGET, errp)) {
             goto out;
         }
-        commit_start(has_job_id ? job_id : NULL, bs, base_bs, top_bs, speed,
-                     on_error, has_backing_file ? backing_file : NULL,
+        commit_start(has_job_id ? job_id : NULL, bs, base_bs, top_bs, job_flags,
+                     speed, on_error, has_backing_file ? backing_file : NULL,
                      filter_node_name, &local_err);
     }
     if (local_err != NULL) {
@@ -3587,8 +3641,11 @@ static void blockdev_mirror_common(const char *job_id, BlockDriverState *bs,
                                    bool has_filter_node_name,
                                    const char *filter_node_name,
                                    bool has_copy_mode, MirrorCopyMode copy_mode,
+                                   bool has_auto_finalize, bool auto_finalize,
+                                   bool has_auto_dismiss, bool auto_dismiss,
                                    Error **errp)
 {
+    int job_flags = JOB_DEFAULT;
 
     if (!has_speed) {
         speed = 0;
@@ -3613,6 +3670,12 @@ static void blockdev_mirror_common(const char *job_id, BlockDriverState *bs,
     }
     if (!has_copy_mode) {
         copy_mode = MIRROR_COPY_MODE_BACKGROUND;
+    }
+    if (has_auto_finalize && !auto_finalize) {
+        job_flags |= JOB_MANUAL_FINALIZE;
+    }
+    if (has_auto_dismiss && !auto_dismiss) {
+        job_flags |= JOB_MANUAL_DISMISS;
     }
 
     if (granularity != 0 && (granularity < 512 || granularity > 1048576 * 64)) {
@@ -3641,7 +3704,7 @@ static void blockdev_mirror_common(const char *job_id, BlockDriverState *bs,
      * and will allow to check whether the node still exist at mirror completion
      */
     mirror_start(job_id, bs, target,
-                 has_replaces ? replaces : NULL,
+                 has_replaces ? replaces : NULL, job_flags,
                  speed, granularity, buf_size, sync, backing_mode,
                  on_source_error, on_target_error, unmap, filter_node_name,
                  copy_mode, errp);
@@ -3791,6 +3854,8 @@ void qmp_drive_mirror(DriveMirror *arg, Error **errp)
                            arg->has_unmap, arg->unmap,
                            false, NULL,
                            arg->has_copy_mode, arg->copy_mode,
+                           arg->has_auto_finalize, arg->auto_finalize,
+                           arg->has_auto_dismiss, arg->auto_dismiss,
                            &local_err);
     bdrv_unref(target_bs);
     error_propagate(errp, local_err);
@@ -3812,6 +3877,8 @@ void qmp_blockdev_mirror(bool has_job_id, const char *job_id,
                          bool has_filter_node_name,
                          const char *filter_node_name,
                          bool has_copy_mode, MirrorCopyMode copy_mode,
+                         bool has_auto_finalize, bool auto_finalize,
+                         bool has_auto_dismiss, bool auto_dismiss,
                          Error **errp)
 {
     BlockDriverState *bs;
@@ -3845,6 +3912,8 @@ void qmp_blockdev_mirror(bool has_job_id, const char *job_id,
                            true, true,
                            has_filter_node_name, filter_node_name,
                            has_copy_mode, copy_mode,
+                           has_auto_finalize, auto_finalize,
+                           has_auto_dismiss, auto_dismiss,
                            &local_err);
     error_propagate(errp, local_err);
 

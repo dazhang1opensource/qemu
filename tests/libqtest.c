@@ -21,10 +21,10 @@
 #include <sys/un.h>
 
 #include "libqtest.h"
+#include "qemu-common.h"
 #include "qemu/cutils.h"
 #include "qapi/error.h"
 #include "qapi/qmp/json-parser.h"
-#include "qapi/qmp/json-streamer.h"
 #include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qjson.h"
 #include "qapi/qmp/qlist.h"
@@ -48,10 +48,6 @@ struct QTestState
 static GHookList abrt_hooks;
 static struct sigaction sigact_old;
 
-#define g_assert_no_errno(ret) do { \
-    g_assert_cmpint(ret, !=, -1); \
-} while (0)
-
 static int qtest_query_target_endianness(QTestState *s);
 
 static int init_socket(const char *socket_path)
@@ -61,7 +57,7 @@ static int init_socket(const char *socket_path)
     int ret;
 
     sock = socket(PF_UNIX, SOCK_STREAM, 0);
-    g_assert_no_errno(sock);
+    g_assert_cmpint(sock, !=, -1);
 
     addr.sun_family = AF_UNIX;
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
@@ -70,9 +66,9 @@ static int init_socket(const char *socket_path)
     do {
         ret = bind(sock, (struct sockaddr *)&addr, sizeof(addr));
     } while (ret == -1 && errno == EINTR);
-    g_assert_no_errno(ret);
+    g_assert_cmpint(ret, !=, -1);
     ret = listen(sock, 1);
-    g_assert_no_errno(ret);
+    g_assert_cmpint(ret, !=, -1);
 
     return sock;
 }
@@ -325,7 +321,6 @@ static void socket_send(int fd, const char *buf, size_t size)
             continue;
         }
 
-        g_assert_no_errno(len);
         g_assert_cmpint(len, >, 0);
 
         offset += len;
@@ -446,14 +441,15 @@ typedef struct {
     QDict *response;
 } QMPResponseParser;
 
-static void qmp_response(JSONMessageParser *parser, GQueue *tokens)
+static void qmp_response(void *opaque, QObject *obj, Error *err)
 {
-    QMPResponseParser *qmp = container_of(parser, QMPResponseParser, parser);
-    QObject *obj;
+    QMPResponseParser *qmp = opaque;
 
-    obj = json_parser_parse(tokens, NULL);
-    if (!obj) {
-        fprintf(stderr, "QMP JSON response parsing failed\n");
+    assert(!obj != !err);
+
+    if (err) {
+        error_prepend(&err, "QMP JSON response parsing failed: ");
+        error_report_err(err);
         abort();
     }
 
@@ -468,7 +464,7 @@ QDict *qmp_fd_receive(int fd)
     bool log = getenv("QTEST_LOG") != NULL;
 
     qmp.response = NULL;
-    json_message_parser_init(&qmp.parser, qmp_response);
+    json_message_parser_init(&qmp.parser, qmp_response, &qmp, NULL);
     while (!qmp.response) {
         ssize_t len;
         char c;
@@ -506,16 +502,6 @@ QDict *qtest_qmp_receive(QTestState *s)
 void qmp_fd_vsend(int fd, const char *fmt, va_list ap)
 {
     QObject *qobj;
-
-    /*
-     * qobject_from_vjsonf_nofail() chokes on leading 0xff as invalid
-     * JSON, but tests/test-qga.c needs to send that to test QGA
-     * synchronization
-     */
-    if (*fmt == '\377') {
-        socket_send(fd, fmt, 1);
-        fmt++;
-    }
 
     /* Going through qobject ensures we escape strings properly */
     qobj = qobject_from_vjsonf_nofail(fmt, ap);
@@ -601,6 +587,36 @@ void qtest_qmp_send(QTestState *s, const char *fmt, ...)
 
     va_start(ap, fmt);
     qtest_qmp_vsend(s, fmt, ap);
+    va_end(ap);
+}
+
+void qmp_fd_vsend_raw(int fd, const char *fmt, va_list ap)
+{
+    bool log = getenv("QTEST_LOG") != NULL;
+    char *str = g_strdup_vprintf(fmt, ap);
+
+    if (log) {
+        fprintf(stderr, "%s", str);
+    }
+    socket_send(fd, str, strlen(str));
+    g_free(str);
+}
+
+void qmp_fd_send_raw(int fd, const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    qmp_fd_vsend_raw(fd, fmt, ap);
+    va_end(ap);
+}
+
+void qtest_qmp_send_raw(QTestState *s, const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    qmp_fd_vsend_raw(s->qmp_fd, fmt, ap);
     va_end(ap);
 }
 
@@ -991,7 +1007,53 @@ bool qtest_big_endian(QTestState *s)
     return s->big_endian;
 }
 
-void qtest_cb_for_every_machine(void (*cb)(const char *machine))
+static bool qtest_check_machine_version(const char *mname, const char *basename,
+                                        int major, int minor)
+{
+    char *newname;
+    bool is_equal;
+
+    newname = g_strdup_printf("%s-%i.%i", basename, major, minor);
+    is_equal = g_str_equal(mname, newname);
+    g_free(newname);
+
+    return is_equal;
+}
+
+static bool qtest_is_old_versioned_machine(const char *mname)
+{
+    const char *dash = strrchr(mname, '-');
+    const char *dot = strrchr(mname, '.');
+    const char *chr;
+    char *bname;
+    const int major = QEMU_VERSION_MAJOR;
+    const int minor = QEMU_VERSION_MINOR;
+    bool res = false;
+
+    if (dash && dot && dot > dash) {
+        for (chr = dash + 1; *chr; chr++) {
+            if (!qemu_isdigit(*chr) && *chr != '.') {
+                return false;
+            }
+        }
+        /*
+         * Now check if it is one of the latest versions. Check major + 1
+         * and minor + 1 versions as well, since they might already exist
+         * in the development branch.
+         */
+        bname = g_strdup(mname);
+        bname[dash - mname] = 0;
+        res = !qtest_check_machine_version(mname, bname, major + 1, 0) &&
+              !qtest_check_machine_version(mname, bname, major, minor + 1) &&
+              !qtest_check_machine_version(mname, bname, major, minor);
+        g_free(bname);
+    }
+
+    return res;
+}
+
+void qtest_cb_for_every_machine(void (*cb)(const char *machine),
+                                bool skip_old_versioned)
 {
     QDict *response, *minfo;
     QList *list;
@@ -1014,7 +1076,9 @@ void qtest_cb_for_every_machine(void (*cb)(const char *machine))
         qstr = qobject_to(QString, qobj);
         g_assert(qstr);
         mname = qstring_get_str(qstr);
-        cb(mname);
+        if (!skip_old_versioned || !qtest_is_old_versioned_machine(mname)) {
+            cb(mname);
+        }
     }
 
     qtest_end();
@@ -1124,4 +1188,15 @@ bool qmp_rsp_is_err(QDict *rsp)
     QDict *error = qdict_get_qdict(rsp, "error");
     qobject_unref(rsp);
     return !!error;
+}
+
+void qmp_assert_error_class(QDict *rsp, const char *class)
+{
+    QDict *error = qdict_get_qdict(rsp, "error");
+
+    g_assert_cmpstr(qdict_get_try_str(error, "class"), ==, class);
+    g_assert_nonnull(qdict_get_try_str(error, "desc"));
+    g_assert(!qdict_haskey(rsp, "return"));
+
+    qobject_unref(rsp);
 }
